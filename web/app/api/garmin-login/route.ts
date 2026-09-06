@@ -1,3 +1,4 @@
+import postgres from "postgres";
 import { NextResponse } from "next/server";
 import { DBTokenStore } from "garmin-auth";
 import { GARMIN_TOKEN_PLATFORM, resetGarminClient } from "@/lib/garmin-upload";
@@ -24,9 +25,31 @@ export const runtime = "nodejs";
 /** Persist the DI tokens (nested {garmin_tokens:{...}}) for the sync engine. */
 async function persist(url: string, result: WorkerLoginResult): Promise<void> {
   const tokens = tokensFromResult(result);
-  if (!tokens) throw new Error("Login succeeded but no DI tokens were returned.");
-  const store = new DBTokenStore(url, GARMIN_TOKEN_PLATFORM);
-  await store.save(tokens);
+  if (!tokens) {
+    throw new Error("Login succeeded but no DI tokens were returned.");
+  }
+
+  const sql = postgres(url, { prepare: false });
+
+  await sql`
+    INSERT INTO platform_credentials
+      (platform, auth_type, credentials, connected_at, status)
+    VALUES
+      (
+        ${GARMIN_TOKEN_PLATFORM},
+        'oauth',
+        ${sql.json({ garmin_tokens: tokens })},
+        NOW(),
+        'connected'
+      )
+    ON CONFLICT (platform)
+    DO UPDATE SET
+      credentials = EXCLUDED.credentials,
+      connected_at = EXCLUDED.connected_at,
+      status = 'connected'
+  `;
+
+  await sql.end();
   resetGarminClient();
 }
 
