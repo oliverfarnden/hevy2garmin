@@ -29,12 +29,15 @@ async function loadSetup(): Promise<SetupData> {
   const rows = await sql`
     SELECT platform, status, connected_at
     FROM platform_credentials
-    WHERE platform IN ('hevy', 'garmin')
+    WHERE platform IN ('hevy', 'garmin_tokens')
   `.catch(() => [] as Conn[]);
   const find = (p: string): Conn | null =>
-    rows.find((r) => r.platform === p) ?? null;
-  return { dbConfigured: true, hevy: find("hevy"), garmin: find("garmin") };
-}
+  rows.find((r) => r.platform === p) ?? null;
+  return {
+  dbConfigured: true,
+  hevy: find("hevy"),
+  garmin: find("garmin_tokens"),
+};
 
 function isConnected(c: Conn | null): boolean {
   return Boolean(c && c.status !== "disconnected");
