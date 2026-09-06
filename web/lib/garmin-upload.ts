@@ -1,19 +1,10 @@
 /**
- * Garmin upload wrappers — the DANGEROUS half of the sync engine.
+ * Garmin upload wrappers.
  *
- * This module is the ONLY place in the web app that can write to Garmin
- * Connect (upload a FIT, rename, set a description). A bad Garmin upload
- * creates a duplicate Garmin/Strava activity, which is a hard user constraint,
- * so every entry point here is a thin, explicit wrapper over the published
- * `hevy2garmin` package's Garmin ops — no FIT generation, no HTTP is
- * reimplemented, and nothing in this file decides WHETHER to upload.
- *
- * `getGarminClient()` READS the stored DI tokens from platform_credentials
- * (platform='garmin_tokens') via garmin-auth. Building the client performs no
- * activity write; it only authenticates. The functions that mutate Garmin
- * (`upload`, `rename`, `describe`) are called by sync-one ONLY on the live path
- * (dryRun === false). `findExistingActivity` is a READ (the 409-prevention
- * lookup) and is always safe to call.
+ * Garmin DI tokens are stored in platform_credentials under
+ * platform='garmin_tokens'. Authentication is performed from those
+ * stored DI tokens; the Cloudflare Worker is responsible for obtaining
+ * fresh tokens during the Garmin login flow.
  */
 import { getDb } from "./db";
 import { GarminAuth, DBTokenStore, type GarminClient } from "garmin-auth";
@@ -32,54 +23,99 @@ let cachedClient: GarminClient | null = null;
 let normalized = false;
 
 /**
- * Self-heal the token row (#459). garmin-auth < 0.3 (Python 0.2.x) wrote the DI payload FLAT
- * ({di_token, …}); 0.3+ on both stacks writes it NESTED under `garmin_tokens`, which is the only
- * shape DBTokenStore reads. A fork whose row was written by an older deploy would be told to
- * "reconnect Garmin" for no reason. Idempotent; runs once per process; never throws.
+ * Convert an older flat DI-token row into the nested format expected by
+ * garmin-auth's DBTokenStore.
+ *
+ * Older versions stored:
+ *   { di_token, ... }
+ *
+ * Current versions expect:
+ *   { garmin_tokens: { di_token, ... } }
  */
-export async function normalizeGarminTokenRow(sql: ReturnType<typeof getDb>): Promise<void> {
+export async function normalizeGarminTokenRow(
+  sql: ReturnType<typeof getDb>,
+): Promise<void> {
   if (normalized) return;
+
   try {
     await sql`
       UPDATE platform_credentials
-         SET credentials = jsonb_build_object('garmin_tokens', credentials), auth_type = 'oauth', status = 'active'
-       WHERE platform = ${GARMIN_TOKEN_PLATFORM}
-         AND credentials ? 'di_token'
-         AND NOT (credentials ? 'garmin_tokens')`;
+      SET
+        credentials = jsonb_build_object('garmin_tokens', credentials),
+        auth_type = 'oauth',
+        status = 'connected'
+      WHERE platform = ${GARMIN_TOKEN_PLATFORM}
+        AND credentials ? 'di_token'
+        AND NOT (credentials ? 'garmin_tokens')
+    `;
+
     normalized = true;
-  } catch { /* best effort: DBTokenStore reports the real problem if any */ }
+  } catch {
+    // DBTokenStore will surface the real authentication/database error.
+  }
 }
 
 /**
- * Build (and cache) an authenticated GarminClient from the DI tokens stored in
- * Postgres. Uses garmin-auth's DBTokenStore, which reads
- * platform_credentials.credentials->garmin_tokens (the NESTED shape the TS
- * stack writes). Throws when DATABASE_URL is unset or the tokens are missing /
- * need a fresh MFA login — callers surface that as a "reconnect Garmin" error.
+ * Build an authenticated Garmin client from the DI tokens already stored
+ * in Postgres.
  *
- * This authenticates only; it does not upload or mutate any activity.
+ * IMPORTANT:
+ * Garmin login itself is NOT performed here. Garmin login/MFA is handled
+ * by the Cloudflare Worker during /api/garmin-login. This function only
+ * consumes the resulting DI tokens.
  */
-export async function getGarminClient(databaseUrl?: string): Promise<GarminClient> {
+export async function getGarminClient(
+  databaseUrl?: string,
+): Promise<GarminClient> {
   if (cachedClient) return cachedClient;
+
   const url = databaseUrl ?? process.env.DATABASE_URL;
-  if (!url) throw new Error("DATABASE_URL not set (cannot load Garmin tokens)");
-  try { await normalizeGarminTokenRow(getDb()); } catch { /* no DB handle: DBTokenStore reports it */ }
+
+  if (!url) {
+    throw new Error("DATABASE_URL not set (cannot load Garmin tokens)");
+  }
+
+  const sql = getDb();
+
+  await normalizeGarminTokenRow(sql);
+
   const store = new DBTokenStore(url, GARMIN_TOKEN_PLATFORM);
-  const auth = new GarminAuth({ store });
-  cachedClient = await auth.client();
-  return cachedClient;
+
+  try {
+    const auth = new GarminAuth({ store });
+    cachedClient = await auth.client();
+    return cachedClient;
+  } catch (err) {
+    cachedClient = null;
+
+    const message = err instanceof Error ? err.message : String(err);
+
+    // Make the required recovery action explicit instead of disguising the
+    // Garmin authentication failure as a generic sync failure.
+    if (
+      message.toLowerCase().includes("mfa") ||
+      message.toLowerCase().includes("fresh sso") ||
+      message.toLowerCase().includes("login needs")
+    ) {
+      throw new Error(
+        "Garmin authentication has expired. Go to Settings → Garmin, " +
+        "disconnect Garmin, then reconnect using the Cloudflare Worker login " +
+        "before syncing again.",
+      );
+    }
+
+    throw err;
+  }
 }
 
-/** Reset the cached client (test seam / after a token rotation). */
+/** Reset the cached client after Garmin credentials are rotated. */
 export function resetGarminClient(): void {
   cachedClient = null;
 }
 
 /**
- * READ: is there already a Garmin activity at this start time? This is dedup
- * layer 2 — the pre-upload lookup that prevents a duplicate (409) upload. Thin
- * passthrough to the package's findActivityByStartTime. Returns the existing
- * activity id, or null when the timestamp is free. Never writes.
+ * READ: check whether a Garmin activity already exists at this start time.
+ * This is the duplicate-prevention lookup and does not write anything.
  */
 export async function findExistingActivity(
   client: GarminClient,
@@ -89,9 +125,7 @@ export async function findExistingActivity(
 }
 
 /**
- * WRITE: upload a FIT (bytes) to Garmin. Thin passthrough to the package's
- * uploadFit. Only ever reached on the live sync path (dryRun === false); the
- * dry-run path returns before any wrapper here is called.
+ * WRITE: upload a FIT file to Garmin.
  */
 export async function upload(
   client: GarminClient,
@@ -101,7 +135,7 @@ export async function upload(
   return uploadFit(client, fit, workoutStart);
 }
 
-/** WRITE: rename a Garmin activity. Thin passthrough to renameActivity. */
+/** WRITE: rename a Garmin activity. */
 export async function rename(
   client: GarminClient,
   activityId: number,
@@ -110,7 +144,7 @@ export async function rename(
   return renameActivity(client, activityId, name);
 }
 
-/** WRITE: set a Garmin activity's description. Thin passthrough to setDescription. */
+/** WRITE: set a Garmin activity description. */
 export async function describe(
   client: GarminClient,
   activityId: number,
