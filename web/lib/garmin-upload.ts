@@ -1,5 +1,5 @@
 import { getDb } from "./db";
-import { GarminAuth, DBTokenStore, type GarminClient } from "garmin-auth";
+import { DBTokenStore, GarminClient } from "garmin-auth";
 import {
   uploadFit,
   findActivityByStartTime,
@@ -18,22 +18,20 @@ export async function normalizeGarminTokenRow(
 ): Promise<void> {
   if (normalized) return;
 
-  try {
-    await sql`
-      UPDATE platform_credentials
-      SET
-        credentials = jsonb_build_object('garmin_tokens', credentials),
-        auth_type = 'oauth',
-        status = 'connected'
-      WHERE platform = ${GARMIN_TOKEN_PLATFORM}
-        AND credentials ? 'di_token'
-        AND NOT (credentials ? 'garmin_tokens')
-    `;
+  await sql`
+    UPDATE platform_credentials
+       SET credentials = jsonb_build_object(
+         'garmin_tokens',
+         credentials
+       ),
+       auth_type = 'oauth',
+       status = 'active'
+     WHERE platform = ${GARMIN_TOKEN_PLATFORM}
+       AND credentials ? 'di_token'
+       AND NOT (credentials ? 'garmin_tokens')
+  `;
 
-    normalized = true;
-  } catch {
-    // DBTokenStore will report the real problem.
-  }
+  normalized = true;
 }
 
 export async function getGarminClient(
@@ -50,12 +48,26 @@ export async function getGarminClient(
   const sql = getDb();
   await normalizeGarminTokenRow(sql);
 
-  const store = new DBTokenStore(url, GARMIN_TOKEN_PLATFORM);
-  const auth = new GarminAuth({ store });
+  const store = new DBTokenStore(
+    url,
+    GARMIN_TOKEN_PLATFORM,
+  );
 
-  cachedClient = await auth.client();
+  const tokens = await store.load();
 
-  return cachedClient;
+  if (!tokens) {
+    throw new Error(
+      "No Garmin DI tokens found. Connect Garmin again through the Garmin login worker.",
+    );
+  }
+
+  const client = new GarminClient();
+
+  client.loads(tokens);
+
+  cachedClient = client;
+
+  return client;
 }
 
 export function resetGarminClient(): void {
