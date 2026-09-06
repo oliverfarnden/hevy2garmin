@@ -46,7 +46,6 @@ export async function getGarminClient(
   }
 
   const sql = getDb();
-  await normalizeGarminTokenRow(sql);
 
   const store = new DBTokenStore(
     url,
